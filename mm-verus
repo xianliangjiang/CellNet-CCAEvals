@@ -1,0 +1,131 @@
+#!/usr/bin/perl -w
+
+use strict;
+use LWP::UserAgent;
+use HTTP::Request::Common;
+
+# Downlink Trace File
+my $down_linkfile = $ARGV[ 0 ];
+# Uplink Trace File
+my $up_linkfile = $ARGV[ 1 ];
+# Log File to Store the Result of Mahimahi
+my $logfile = $ARGV[ 2 ];
+# Server Port Which Connected by Client
+my $port = $ARGV[ 3 ];
+# Link Delay Which is Half of RTT
+my $rtt = $ARGV[ 4 ];
+# Packet Loss Rate in Cellular Link
+my $loss_rate = $ARGV[ 5 ];
+# Queuing Algorithm in Base Station
+my $queue_alg = $ARGV[ 6 ];
+# Buffer Size in Base Station
+my $buffer_size = $ARGV[ 7 ];
+# Trace Set Which You Chose
+my $traceset = $ARGV[ 8 ];
+# Data Transfer Time
+my $duration = $ARGV[ 9 ];
+
+if ( @ARGV != 10 ) {
+	die "The Number of Input Parameters must be 10.";
+} elsif ( not defined $down_linkfile or not defined $up_linkfile ) {
+	die "Usage: $0 DOWN_LINKFILE UP_LINKFILE LOG_FILE PORT RTT LOSS_RATE QUEUE_ALG BUFFER_SIZE TRACESET DURATION\n";
+}
+
+my $receiver_pid = fork;
+if ( $receiver_pid < 0 ) {
+	die qq{$!};
+} elsif ( $receiver_pid == 0 ) {
+	# child
+	exec "\$VERUS_SERVER -name test -p $port -t $duration" or die qq{$!};
+}
+
+# run the sender inside a linkshell and a delayshell
+my @command = qw{mm-delay 20 mm-loss uplink 0 mm-link UPLINK DOWNLINK};
+# display livegraphs if we seem to be running under X
+if ( defined $ENV{ 'DISPLAY' } ) {
+	# push @command, qw{--meter-uplink --meter-uplink-delay};
+	# both per-packet queueing delay and uplink/downlink throughput will be plotted in real-time
+	# push @command, qw{--meter-all};
+	push @command, qw{--meter-uplink};
+}
+push @command, qw{--once --uplink-log --downlink-log --uplink-queue --uplink-queue-args --downlink-queue --downlink-queue-args -- sh -c};
+push @command, "\$VERUS_CLIENT \$MAHIMAHI_BASE -p $port";
+
+# Reconfigure parameters
+my $link_delay = $rtt/2.0;
+die unless $command[ 1 ] eq "20";
+$command[ 1 ] = "$link_delay";
+
+die unless $command[ 4 ] eq "0";
+$command[ 4 ] = "$loss_rate";
+
+die unless $command[ 6 ] eq "UPLINK";
+$command[ 6 ] = qq{traces/$traceset/$up_linkfile};
+
+die unless $command[ 7 ] eq "DOWNLINK";
+$command[ 7 ] = qq{traces/$traceset/$down_linkfile};
+
+if ( defined $ENV{ 'DISPLAY' } ) {
+	die unless $command[ 10 ] eq "--uplink-log";
+	$command[ 10 ] = qq{--uplink-log=up-$logfile-$rtt};
+	
+	die unless $command[ 11 ] eq "--downlink-log";
+	$command[ 11 ] = qq{--downlink-log=down-$logfile-$rtt};
+
+	die unless $command[ 12 ] eq "--uplink-queue";
+	$command[ 12 ] = qq{--uplink-queue=$queue_alg};
+
+	die unless $command[ 14 ] eq "--downlink-queue";
+	$command[ 14 ] = qq{--downlink-queue=$queue_alg};
+
+	if ( $queue_alg eq "codel" ) {
+		die unless $command[ 13 ] eq "--uplink-queue-args";
+		$command[ 13 ] = qq{--uplink-queue-args=\"packets=$buffer_size,target=50,interval=100\"};
+		die unless $command[ 15 ] eq "--downlink-queue-args";
+		$command[ 15 ] = qq{--downlink-queue-args=\"packets=$buffer_size,target=50,interval=100\"};
+	} elsif ( $queue_alg eq "pie" ) {
+		die unless $command[ 13 ] eq "--uplink-queue-args";
+		$command[ 13 ] = qq{--uplink-queue-args=\"packets=$buffer_size,qdelay_ref=50,max_burst=100\"};
+		die unless $command[ 15 ] eq "--downlink-queue-args";
+		$command[ 15 ] = qq{--downlink-queue-args=\"packets=$buffer_size,qdelay_ref=50,max_burst=100\"};
+	} else { # default: droptail
+		die unless $command[ 13 ] eq "--uplink-queue-args";
+		$command[ 13 ] = qq{--uplink-queue-args=\"packets=$buffer_size\"};
+		die unless $command[ 15 ] eq "--downlink-queue-args";
+		$command[ 15 ] = qq{--downlink-queue-args=\"packets=$buffer_size\"};
+	}
+} else {
+	die unless $command[ 9 ] eq "--uplink-log";
+	$command[ 9 ] = qq{--uplink-log=up-$logfile-$rtt};
+	
+	die unless $command[ 10 ] eq "--downlink-log";
+	$command[ 10 ] = qq{--downlink-log=down-$logfile-$rtt};
+
+	die unless $command[ 11 ] eq "--uplink-queue";
+	$command[ 11 ] = qq{--uplink-queue=$queue_alg};
+
+	die unless $command[ 13 ] eq "--downlink-queue";
+	$command[ 13 ] = qq{--downlink-queue=$queue_alg};
+
+	if ( $queue_alg eq "codel" ) {
+		die unless $command[ 12 ] eq "--uplink-queue-args";
+		$command[ 12 ] = qq{--uplink-queue-args=\"packets=$buffer_size,target=50,interval=100\"};
+		die unless $command[ 14 ] eq "--downlink-queue-args";
+		$command[ 14 ] = qq{--downlink-queue-args=\"packets=$buffer_size,target=50,interval=100\"};
+	} elsif ( $queue_alg eq "pie" ) {
+		die unless $command[ 12 ] eq "--uplink-queue-args";
+		$command[ 12 ] = qq{--uplink-queue-args=\"packets=$buffer_size,qdelay_ref=50,max_burst=100\"};
+		die unless $command[ 14 ] eq "--downlink-queue-args";
+		$command[ 14 ] = qq{--downlink-queue-args=\"packets=$buffer_size,qdelay_ref=50,max_burst=100\"};
+	} else { # default: droptail
+		die unless $command[ 12 ] eq "--uplink-queue-args";
+		$command[ 12 ] = qq{--uplink-queue-args=\"packets=$buffer_size\"};
+		die unless $command[ 14 ] eq "--downlink-queue-args";
+		$command[ 14 ] = qq{--downlink-queue-args=\"packets=$buffer_size\"};
+	}
+}
+
+system @command;
+
+# kill the receiver
+kill 'INT', $receiver_pid;

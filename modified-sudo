@@ -1,0 +1,9 @@
+cd /etc/sudoers.d
+sudo touch nopasswd4sudo
+sudo gedit nopasswd4sudo
+
+Input: [yourusername] ALL=(ALL) NOPASSWD : ALL
+
+save
+ 
+

@@ -1,0 +1,73 @@
+#!/bin/bash
+#set -x # Enable logging of executed commands.
+set -e # Stop if any error occurs.
+######################Welcome Banner###########################
+echo "==================================================="
+echo "Welcome to Use Cellular Network Simulator(Ubuntu 16.04.1, Kernel 4.15)"
+echo "Press Any Key to Continue (Run Only Once)"
+echo "==================================================="
+read anychar
+
+#####################INSTALL MAHIMAHI######################
+sudo apt-get update
+echo "==================================================="
+echo "Installing Required Packages by Mahimahi Simulator"
+echo "==================================================="
+sudo apt-get install -y libprotobuf-dev protobuf-compiler autotools-dev dh-autoreconf iptables pkg-config dnsmasq-base
+sudo apt-get install -y apache2-bin debhelper libssl-dev ssl-cert libxcb-present-dev libcairo2-dev libpango1.0-dev apache2-dev libwww-perl perl git
+
+echo "==================================================="
+echo "Installing Python PIP and TK (Graph Plotting)"
+echo "==================================================="
+sudo apt-get install -y python-pip python-tk iperf python-numpy python-matplotlib
+# pip install --upgrade pip
+# sudo pip install -U pip
+# sudo python -m pip install -U pip == 8.0.1
+python -m pip install matplotlib
+
+echo "==================================================="
+echo "Install Mahimahi Simulator"
+echo "==================================================="
+if [ -d "mahimahi" ]; then
+	rm -rf mahimahi
+fi
+git clone https://github.com/nbueecs/mahimahi-nbu.git mahimahi
+cd mahimahi ; ./autogen.sh ; ./configure ; make ; sudo make install ; cd ..
+
+###################INSTALL Protocol Modules#####################
+if [ -d "protocols" ]; then
+	rm -rf protocols
+	mkdir protocols
+else
+	mkdir protocols
+fi
+echo "==================================================="
+echo "Compiling Sprout Protocol"
+echo "==================================================="
+sudo apt-get install -y libboost-math-dev libboost-math1.58.0 libprotobuf9v5 libprotobuf-dev libtinfo-dev libncurses-dev
+cd protocols ; git clone https://github.com/nbueecs/sprout.git
+cd sprout ; ./autogen.sh ; ./configure --enable-examples ; make ; cd ../../
+
+echo "==================================================="
+echo "Compiling Verus Protocol"
+echo "==================================================="
+sudo apt-get install -y build-essential autoconf libtbb-dev libasio-dev libalglib-dev libboost-system1.58-dev libboost-system-dev
+cd protocols ; git clone https://github.com/nbueecs/verus.git
+cd verus ; autoreconf -i ; ./configure ; make ; cd ../../
+
+echo "==================================================="
+echo "Compiling SCReAM Protocol"
+echo "==================================================="
+cd protocols ; git clone https://github.com/nbueecs/scream.git
+cd scream ; ./autogen.sh ; ./configure ; make ; cd ../../
+
+echo "==================================================="
+echo "Compiling PCC Protocol"
+echo "==================================================="
+cd protocols ; git clone https://github.com/nbueecs/pcc.git
+cd pcc/sender ; make clean ; make
+cd ../receiver ; make clean ; make ; cd ../../../
+
+echo "==================================================="
+echo "Finish to Install Required Packages"
+echo "==================================================="
