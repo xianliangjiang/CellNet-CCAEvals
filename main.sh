@@ -21,10 +21,10 @@ then
 	exit 1;
 fi
 ######################General Environment###########################
-export SPROUT_MODEL_IN="../protocols/sprout/src/examples/sprout.model"
-export SPROUT_BT2="../protocols/sprout/src/examples/sproutbt2"
-export VERUS_SERVER="../protocols/verus/src/verus_server"
-export VERUS_CLIENT="../protocols/verus/src/verus_client"
+export SPROUT_MODEL_IN="./protocols/sprout/src/examples/sprout.model"
+export SPROUT_BT2="./protocols/sprout/src/examples/sproutbt2"
+export VERUS_SERVER="./protocols/verus/src/verus_server"
+export VERUS_CLIENT="./protocols/verus/src/verus_client"
 
 # Manually extensible part: uplink and downlink trace file, congestion control algorithms
 if [[ $traceset == "mit" ]]; then
@@ -261,11 +261,3 @@ else
 	echo "The simulation type is wrong!!"	
 	exit 1
 fi
-
-#########################Post-Processing############################
-mv $simtype.d results/$simtype-$traceset.d
-python process.py results/$simtype-$traceset.d results/$simtype-$traceset.csv
-#python figures.py results/$simtype.csv figures/fig
-
-#echo "Open a browser and navigate to http://<ip_address>/figures/ to view the figures."
-#sudo python -m SimpleHTTPServer 80
