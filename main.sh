@@ -46,7 +46,7 @@ fi
 
 TCPCCA=("hybla" "illinois" "lp" "nv" "vegas" "veno" "westwood" "bbr" "cdg" "verus" "sprout")
 RTT=("10" "20" "40" "80" "120" "160" "200") # ms
-QUEUE_ALG=("droptail" "codel" "pie")
+QUEUE_ALG=("droptail" "codel" "pie" "red" "abc")
 BUFFER_SIZE=("50" "100" "200" "300" "400" "500")
 LOSS_RATE=("0.00001" "0.0001" "0.001" "0.01" "0.1")
 
@@ -242,3 +242,5 @@ else
 	echo "The simulation type is wrong!!"	
 	exit 1
 fi
+
+echo "===========Finish Simulation!!============="
