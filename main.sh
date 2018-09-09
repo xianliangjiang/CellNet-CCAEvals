@@ -44,25 +44,6 @@ else
 	exit 1
 fi
 
-if [ -d "results" ]; then
-	rm -rf results
-	mkdir results
-else
-	mkdir results
-fi
-
-if [ -d "figures" ]; then
-	rm -rf figures
-	mkdir figures
-else
-	mkdir figures
-fi
-
-chmod a+x mm-metric
-chmod a+x mm-tcp
-chmod a+x mm-verus
-chmod a+x mm-sprout
-
 TCPCCA=("hybla" "illinois" "lp" "nv" "vegas" "veno" "westwood" "bbr" "cdg" "verus" "sprout")
 RTT=("10" "20" "40" "80" "120" "160" "200") # ms
 QUEUE_ALG=("droptail" "codel" "pie")
