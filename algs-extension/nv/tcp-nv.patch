@@ -1,0 +1,1069 @@
+Author: Lawrence Brakmo <brakmo@google.com>
+Date:   Thu Oct 24 16:07:50 2013 -0700
+
+    net-tcp_nv: NV enhances Cubic with true congestion avoidance
+    
+    TCP-NV is an enhancement to TCP-CUBIC that adds true congestion
+    avoidance: the cwnd can be decreased before losses occur when
+    congestion (buffer build-up) is detected.
+    
+    TCP-CUBIC is the current default. TCP-NV will not be used unless it is
+    specified as the default CA. Even when NV it is the default, it can be made
+    to behave like Cubic by setting the sysctl net.ipv4.tcp_nv_enable to 0,
+    and this will also apply to existing connections.
+    
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index bc09f82..8398a44 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -346,6 +346,7 @@ struct tcp_sock {
++	u32	tcp_nv_unacked;	/* For passing unacked bytes from skb to TCP NV */
+ 
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index ecce6e2..c8bd47f 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -129,9 +129,9 @@ struct inet_connection_sock {
+ 	} icsk_mtup;
+-	u32			  icsk_ca_priv[16];
++	u32			  icsk_ca_priv[26];
+ 	u32			  icsk_user_timeout;
+-#define ICSK_CA_PRIV_SIZE	(16 * sizeof(u32))
++#define ICSK_CA_PRIV_SIZE	(26 * sizeof(u32))
+ };
+ 
+ #define ICSK_TIME_RETRANS	1	/* Retransmit timer */
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index e15dafc..d026cfc 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -52,6 +52,20 @@ extern struct inet_hashinfo tcp_hashinfo;
+ extern struct percpu_counter tcp_orphan_count;
+ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
+ 
++/* TCP NV sysctls */
++extern unsigned int sysctl_tcp_nv_enable;
++extern unsigned int sysctl_tcp_nv_pad;
++extern unsigned int sysctl_tcp_nv_reset_period;
++extern unsigned int sysctl_tcp_nv_eval_min_calls;
++extern unsigned int sysctl_tcp_nv_rtt_min_cnt;
++extern unsigned int sysctl_tcp_nv_ip_mask;
++extern unsigned int sysctl_tcp_nv_enable_ip_addr;
++extern unsigned int sysctl_tcp_nv_disable_ip_addr;
++extern unsigned int sysctl_tcp_nv_min_cwnd;
++extern unsigned int sysctl_tcp_nv_cong_decrease_mult;
++extern unsigned int sysctl_tcp_nv_rtt_alpha;
++extern unsigned int sysctl_tcp_nv_version;
++
+
+@@ -782,6 +796,8 @@ struct tcp_skb_cb {
+ 	__u8		ip_dsfield;	/* IPv4 tos or IPv6 dsfield	*/
+ 	/* 1 byte hole */
+ 	__u32		ack_seq;	/* Sequence number ACK'd	*/
++	__u32		unacked;	/* bytes unacked when pkt was sent */
++					/* used by nv			   */
+ };
+ 
+ #define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index 37cf1a6..726aa05 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -463,6 +463,15 @@ config TCP_CONG_CUBIC
+ 	among other techniques.
+ 	See http://www.csc.ncsu.edu/faculty/rhee/export/bitcp/cubic-paper.pdf
+ 
++config TCP_CONG_NV
++	tristate "TCP NV on top of CUBIC"
++	default y
++	---help---
++	TCP_NV is an extension to CUBIC that uses true congestion avoidance
++	that tries to prevent packet losses and buffer queue growth,
++	as opposed to the existing congestion control which repeatedly
++	grows the congestion window until losses are triggered.
++
+ config TCP_CONG_WESTWOOD
+ 	tristate "TCP Westwood+"
+ 	default m
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index 4febf8c..d5f857c 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -42,6 +42,7 @@ obj-$(CONFIG_INET_UDP_DIAG) += udp_diag.o
+ obj-$(CONFIG_NET_TCPPROBE) += tcp_probe.o
+ obj-$(CONFIG_TCP_CONG_BIC) += tcp_bic.o
+ obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
++obj-$(CONFIG_TCP_CONG_NV) += tcp_nv.o
+ obj-$(CONFIG_TCP_CONG_WESTWOOD) += tcp_westwood.o
+ obj-$(CONFIG_TCP_CONG_HSTCP) += tcp_highspeed.o
+ obj-$(CONFIG_TCP_CONG_HYBLA) += tcp_hybla.o
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 8082bc8..8d97352 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -32,6 +32,7 @@ static int two = 2;
+ static int four = 4;
+ static int gso_max_segs = GSO_MAX_SEGS;
++static int max_u8 = 0xff;
+ static int tcp_retr1_max = 255;
+ static int ip_local_port_range_min[] = { 1, 1 };
+ static int ip_local_port_range_max[] = { 65535, 65535 };
+@@ -895,6 +896,92 @@ static struct ctl_table ipv4_table[] = {
+ 		.extra1		= &zero
+ 	},
+ 	{
++		.procname	= "tcp_nv_enable",
++		.data		= &sysctl_tcp_nv_enable,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++	{
++		.procname	= "tcp_nv_pad",
++		.data		= &sysctl_tcp_nv_pad,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
++		.procname	= "tcp_nv_reset_period",
++		.data		= &sysctl_tcp_nv_reset_period,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
++		.procname	= "tcp_nv_eval_min_calls",
++		.data		= &sysctl_tcp_nv_eval_min_calls,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
++		.procname	= "tcp_nv_rtt_min_cnt",
++		.data		= &sysctl_tcp_nv_rtt_min_cnt,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
++		.procname	= "tcp_nv_ip_mask",
++		.data		= &sysctl_tcp_nv_ip_mask,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_hex,
++	},
++	{
++		.procname	= "tcp_nv_enable_ip_addr",
++		.data		= &sysctl_tcp_nv_enable_ip_addr,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_hex,
++	},
++	{
++		.procname	= "tcp_nv_disable_ip_addr",
++		.data		= &sysctl_tcp_nv_disable_ip_addr,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_hex,
++	},
++	{
++		.procname	= "tcp_nv_min_cwnd",
++		.data		= &sysctl_tcp_nv_min_cwnd,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
++		.procname	= "tcp_nv_cong_decrease_mult",
++		.data		= &sysctl_tcp_nv_cong_decrease_mult,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
++		.procname	= "tcp_nv_rtt_alpha",
++		.data		= &sysctl_tcp_nv_rtt_alpha,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one,
++		.extra2		= &max_u8,
++	},
++	{
++		.procname	= "tcp_nv_version",
++		.data		= &sysctl_tcp_nv_version,
++		.maxlen		= sizeof(unsigned),
++		.mode		= 0444,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
+
+diff --git a/net/ipv4/tcp_cong.c b/net/ipv4/tcp_cong.c
+index b099231..d7dd00d 100644
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@ -278,6 +278,7 @@ int tcp_set_congestion_control(struct sock *sk, const char *name)
+ 	rcu_read_unlock();
+ 	return err;
+ }
++EXPORT_SYMBOL_GPL(tcp_set_congestion_control);
+ 
+ /* RFC2861 Check whether we are limited by application or congestion window
+  * This is the inverse of cwnd check in tcp_tso_should_defer
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index d36efd1..3ef026b 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3189,6 +3189,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
+ 		} else {
++			tp->tcp_nv_unacked = scb->unacked;
+ 			if (seq_rtt < 0) {
+ 				seq_rtt = ca_seq_rtt;
+ 			}
+diff --git a/net/ipv4/tcp_nv.c b/net/ipv4/tcp_nv.c
+new file mode 100644
+index 0000000..7d1800fc
+--- /dev/null
++++ b/net/ipv4/tcp_nv.c
+@@ -0,0 +1,786 @@
++/*
++ * TCP NV: TCP CUBIC + Congestion Avoidance
++ *
++ * Based on TCP CUBIC
++ *
++ * TCP-NV enhances CUBIC by adding true congestion avoidance,
++ * the ability to detect congestion before packet losses occur.
++ * When congestion (queue buildup) starts to occur, TCP-NV
++ * predicts what the cwnd size should be for the current
++ * level of congestion and it reduces the cwnd proportionally to
++ * the difference between the current cwnd and the predicted cwnd.
++ * TCP-NV behaves like CUBIC when no congestion is detected, or when
++ * recovering from packet losses.
++ * As implemented, TCP-NV can be used in networks with bandwdiths up to 400Gbps
++ * and RTTs of up to 1 hour.
++ * TODO: Add mechanism to deal with reverse congestion
++ *
++ * TCP CUBIC: Binary Increase Congestion control for TCP v2.3
++ * Home page:
++ *      http://netsrv.csc.ncsu.edu/twiki/bin/view/Main/BIC
++ * This is from the implementation of CUBIC TCP in
++ * Sangtae Ha, Injong Rhee and Lisong Xu,
++ *  "CUBIC: A New TCP-Friendly High-Speed TCP Variant"
++ *  in ACM SIGOPS Operating System Review, July 2008.
++ * Available from:
++ *  http://netsrv.csc.ncsu.edu/export/cubic_a_new_tcp_2008.pdf
++ *
++ * CUBIC integrates a new slow start algorithm, called HyStart.
++ * The details of HyStart are presented in
++ *  Sangtae Ha and Injong Rhee,
++ *  "Taming the Elephants: New TCP Slow Start", NCSU TechReport 2008.
++ * Available from:
++ *  http://netsrv.csc.ncsu.edu/export/hystart_techreport_2008.pdf
++ *
++ * All testing results are available from:
++ * http://netsrv.csc.ncsu.edu/wiki/index.php/TCP_Testing
++ *
++ * Unless CUBIC is enabled and congestion window is large
++ * this behaves the same as the original Reno.
++ */
++
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/math64.h>
++#include <net/tcp.h>
++
++#define BICTCP_BETA_SCALE    1024	/* Scale factor beta calculation
++					 * max_cwnd = snd_cwnd * beta
++					 */
++#define	BICTCP_HZ		10	/* BIC HZ 2^10 = 1024 */
++
++/* Two methods of hybrid slow start */
++#define HYSTART_ACK_TRAIN	0x1
++#define HYSTART_DELAY		0x2
++
++/* Number of delay samples for detecting the increase of delay */
++#define HYSTART_MIN_SAMPLES	8
++#define HYSTART_DELAY_MIN	(4U<<3)
++#define HYSTART_DELAY_MAX	(16U<<3)
++#define HYSTART_DELAY_THRESH(x)	clamp(x, HYSTART_DELAY_MIN, HYSTART_DELAY_MAX)
++
++static int fast_convergence __read_mostly = 1;
++static int beta __read_mostly = 717;	/* = 717/1024 (BICTCP_BETA_SCALE) */
++static int initial_ssthresh __read_mostly;
++static int bic_scale __read_mostly = 41;
++static int tcp_friendliness __read_mostly = 1;
++static int ack_cnt_divisor __read_mostly = 2;
++
++static int hystart __read_mostly = 1;
++static int hystart_detect __read_mostly = HYSTART_ACK_TRAIN | HYSTART_DELAY;
++static int hystart_low_window __read_mostly = 16;
++static int hystart_ack_delta __read_mostly = 2;
++
++static u32 cube_rtt_scale __read_mostly;
++static u32 beta_scale __read_mostly;
++static u64 cube_factor __read_mostly;
++
++/* Note parameters that are used for precomputing scale factors are read-only */
++module_param(fast_convergence, int, 0644);
++MODULE_PARM_DESC(fast_convergence, "turn on/off fast convergence");
++module_param(beta, int, 0644);
++MODULE_PARM_DESC(beta, "beta for multiplicative increase");
++module_param(initial_ssthresh, int, 0644);
++MODULE_PARM_DESC(initial_ssthresh, "initial value of slow start threshold");
++module_param(bic_scale, int, 0444);
++MODULE_PARM_DESC(bic_scale, "scale (scaled by 1024) value for bic function (bic_scale/1024)");
++module_param(tcp_friendliness, int, 0644);
++MODULE_PARM_DESC(tcp_friendliness, "turn on/off tcp friendliness");
++module_param(hystart, int, 0644);
++MODULE_PARM_DESC(hystart, "turn on/off hybrid slow start algorithm");
++module_param(hystart_detect, int, 0644);
++MODULE_PARM_DESC(hystart_detect, "hyrbrid slow start detection mechanisms"
++		 " 1: packet-train 2: delay 3: both packet-train and delay");
++module_param(hystart_low_window, int, 0644);
++MODULE_PARM_DESC(hystart_low_window, "lower bound cwnd for hybrid slow start");
++module_param(hystart_ack_delta, int, 0644);
++MODULE_PARM_DESC(hystart_ack_delta, "spacing between ack's indicating train (msecs)");
++module_param(ack_cnt_divisor, int, 0644);
++MODULE_PARM_DESC(ack_cnt_divisor, "Divisor for tcp friendliness ack counting");
++
++/* BIC TCP Parameters */
++struct bictcp {
++	u32 	last_max_cwnd;	/* last maximum snd_cwnd */
++	u32	loss_cwnd;	/* congestion window at last loss */
++	u32	last_cwnd;	/* the last snd_cwnd */
++	u32	last_time;	/* time when updated last_cwnd */
++	u32	bic_origin_point;/* origin point of bic function */
++	u32	bic_K;		/* time to origin point from the beginning of the current epoch */
++	u32	delay_min;	/* min delay (msec << 3) */
++	u32	epoch_start;	/* beginning of an epoch */
++	u32	ack_cnt;	/* number of acks */
++	u32	tcp_cwnd;	/* estimated tcp cwnd */
++	u32	round_start;	/* beginning of each round */
++	u32	end_seq;	/* end_seq of the round */
++	u32	last_ack;	/* last time when the ACK spacing is close */
++	u32	curr_rtt;	/* the minimum rtt of current round */
++	u32	last_bic_target;/* last target cwnd computed by cubic
++				 * (not tcp_friendliness mode) */
++	u8	sample_cnt;	/* number of samples to decide curr_rtt */
++	u8	found;		/* the exit point is found? */
++
++	/* TCP-NV parameters */
++	u8	nv_enable:1,
++		nv_allow_cwnd_growth:1; /* whether cwnd can grow */
++
++	u8	nv_rtt_cnt;	/* RTTs without making decisions */
++	u32	nv_last_rtt;	/* last rtt */
++	u32	nv_min_rtt;	/* active min rtt. Used to determine slope */
++	u32	nv_min_rtt_new;/* min rtt for future use */
++	unsigned long	nv_min_rtt_reset_jiffies;  /* when to switch to
++						      nv_min_rtt_new */
++	u32	nv_rtt_max_rate;	/* max rate seen during current RTT */
++	u32	nv_rtt_start_seq;/* current RTT ends when packet arrives
++				    acking beyond nv_rtt_start_seq */
++	u16	nv_eval_call_cnt; /* call count since last eval */
++	u16	nv_min_cwnd;	  /* nv won't make a ca decision if cwnd is
++				     smaller than this. It may grow to handle
++				   TSO, LRO and interrupt coalescence because
++				   with these a small cwnd cannot saturate
++				   the link. Note that this is different from
++				   sysctl_tcp_nv_min_cwnd */
++	u32	nv_last_snd_una; /* Previous value of tp->snd_una. It is
++				    used to determine bytes acked since last
++				    call to bictcp_acked */
++};
++
++#define NV_INIT_RTT		0xffffffff
++#define NV_MIN_CWND		4
++#define NV_MIN_CWND_GROW	2
++#define NV_TSO_CWND_BOUND	80
++
++static inline void bictcp_reset(struct bictcp *ca)
++{
++	ca->last_max_cwnd = 0;
++	ca->last_cwnd = 0;
++	ca->last_time = 0;
++	ca->bic_origin_point = 0;
++	ca->bic_K = 0;
++	ca->delay_min = 0;
++	ca->epoch_start = 0;
++	ca->ack_cnt = 0;
++	ca->tcp_cwnd = 0;
++	ca->found = 0;
++	ca->last_bic_target = 0;
++	ca->gcn_decr = 0;
++}
++
++static inline void nv_reset(struct bictcp *ca, struct tcp_sock *tp)
++{
++	ca->nv_rtt_cnt = 0;
++	ca->nv_allow_cwnd_growth = 1;
++	ca->nv_last_rtt = 0;
++	ca->nv_min_rtt = NV_INIT_RTT;
++	ca->nv_min_rtt_new = NV_INIT_RTT;
++	ca->nv_min_rtt_reset_jiffies = jiffies +
++					 sysctl_tcp_nv_reset_period*HZ;
++	ca->nv_rtt_max_rate = 0;
++	ca->nv_rtt_start_seq = tp->snd_una;
++	ca->nv_eval_call_cnt = 0;
++	ca->nv_min_cwnd = NV_MIN_CWND;
++	ca->nv_last_snd_una = 0;
++}
++
++static inline u32 bictcp_clock(void)
++{
++#if HZ < 1000
++	return ktime_to_ms(ktime_get_real());
++#else
++	return jiffies_to_msecs(jiffies);
++#endif
++}
++
++
++static inline void bictcp_hystart_reset(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct bictcp *ca = inet_csk_ca(sk);
++
++	ca->round_start = ca->last_ack = bictcp_clock();
++	ca->end_seq = tp->snd_nxt;
++	ca->curr_rtt = 0;
++	ca->sample_cnt = 0;
++}
++
++static void bictcp_init(struct sock *sk)
++{
++	struct bictcp *ca = inet_csk_ca(sk);
++	struct tcp_sock *tp = tcp_sk(sk);
++	__be32 daddr = ntohl(tp->inet_conn.icsk_inet.inet_daddr);
++	__be32 mask = sysctl_tcp_nv_ip_mask;
++	__be32 enable_addr = sysctl_tcp_nv_enable_ip_addr;
++	__be32 disable_addr = sysctl_tcp_nv_disable_ip_addr;
++
++	/* Check whether we should use NV or CUBIC based on destination addr */
++	ca->nv_enable = 0;
++	daddr = daddr & mask;
++	if (enable_addr == 0 || daddr == enable_addr)
++		ca->nv_enable = 1;
++	if (disable_addr != 0 && daddr == disable_addr)
++		ca->nv_enable = 0;
++
++	bictcp_reset(ca);
++	nv_reset(ca, tp);
++
++	ca->loss_cwnd = 0;
++
++	if (hystart)
++		bictcp_hystart_reset(sk);
++
++	if (!hystart && initial_ssthresh)
++		tcp_sk(sk)->snd_ssthresh = initial_ssthresh;
++}
++
++/* calculate the cubic root of x using a table lookup followed by one
++ * Newton-Raphson iteration.
++ * Avg err ~= 0.195%
++ */
++static u32 cubic_root(u64 a)
++{
++	u32 x, b, shift;
++	/*
++	 * cbrt(x) MSB values for x MSB values in [0..63].
++	 * Precomputed then refined by hand - Willy Tarreau
++	 *
++	 * For x in [0..63],
++	 *   v = cbrt(x << 18) - 1
++	 *   cbrt(x) = (v[x] + 10) >> 6
++	 */
++	static const u8 v[] = {
++		/* 0x00 */    0,   54,   54,   54,  118,  118,  118,  118,
++		/* 0x08 */  123,  129,  134,  138,  143,  147,  151,  156,
++		/* 0x10 */  157,  161,  164,  168,  170,  173,  176,  179,
++		/* 0x18 */  181,  185,  187,  190,  192,  194,  197,  199,
++		/* 0x20 */  200,  202,  204,  206,  209,  211,  213,  215,
++		/* 0x28 */  217,  219,  221,  222,  224,  225,  227,  229,
++		/* 0x30 */  231,  232,  234,  236,  237,  239,  240,  242,
++		/* 0x38 */  244,  245,  246,  248,  250,  251,  252,  254,
++	};
++
++	b = fls64(a);
++	if (b < 7) {
++		/* a in [0..63] */
++		return ((u32)v[(u32)a] + 35) >> 6;
++	}
++
++	b = ((b * 84) >> 8) - 1;
++	shift = (a >> (b * 3));
++
++	x = ((u32)(((u32)v[shift] + 10) << b)) >> 6;
++
++	/*
++	 * Newton-Raphson iteration
++	 *                         2
++	 * x    = ( 2 * x  +  a / x  ) / 3
++	 *  k+1          k         k
++	 */
++	x = (2 * x + (u32)div64_u64(a, (u64)x * (u64)(x - 1)));
++	x = ((x * 341) >> 10);
++	return x;
++}
++
++/*
++ * Compute congestion window to use.
++ */
++static inline void bictcp_update(struct bictcp *ca, u32 pkts_acked, u32 cwnd)
++{
++	u32 delta, bic_target;
++	u64 offs, t;
++
++	ca->ack_cnt += pkts_acked;	/* count the number of packets that
++					 * have been ACKed
++					 */
++
++	if (ca->last_cwnd == cwnd &&
++	    (s32)(tcp_time_stamp - ca->last_time) <= HZ / 32)
++		return;
++
++	ca->last_cwnd = cwnd;
++	ca->last_time = tcp_time_stamp;
++
++	if (ca->epoch_start == 0) {
++		ca->epoch_start = tcp_time_stamp;	/* record the beginning
++							   of an epoch */
++		ca->ack_cnt = pkts_acked;		/* start counting */
++		ca->tcp_cwnd = cwnd;			/* syn with cubic */
++		ca->gcn_decr = 0;
++
++		if (ca->last_max_cwnd <= cwnd) {
++			ca->bic_K = 0;
++			ca->bic_origin_point = cwnd;
++		} else {
++			/* Compute new K based on
++			 * (wmax-cwnd) * (srtt>>3 / HZ) / c * 2^(3*bictcp_HZ)
++			 */
++			ca->bic_K = cubic_root(cube_factor
++					       * (ca->last_max_cwnd - cwnd));
++			ca->bic_origin_point = ca->last_max_cwnd;
++		}
++	}
++
++	/* cubic function - calc*/
++	/* calculate c * time^3 / rtt,
++	 *  while considering overflow in calculation of time^3
++	 * (so time^3 is done by using 64 bit)
++	 * and without the support of division of 64bit numbers
++	 * (so all divisions are done by using 32 bit)
++	 *  also NOTE the unit of those veriables
++	 *	  time  = (t - K) / 2^bictcp_HZ
++	 *	  c = bic_scale >> 10
++	 * rtt  = (srtt >> 3) / HZ
++	 * !!! The following code does not have overflow problems,
++	 * if the cwnd < 1 million packets !!!
++	 */
++
++	t = (s32)(tcp_time_stamp - ca->epoch_start);
++	t += msecs_to_jiffies(ca->delay_min >> 3);
++	/* change the unit from HZ to bictcp_HZ */
++	t <<= BICTCP_HZ;
++	do_div(t, HZ);
++
++	if (t < ca->bic_K)		/* t - K */
++		offs = ca->bic_K - t;
++	else
++		offs = t - ca->bic_K;
++
++	/* c/rtt * (t-K)^3 */
++	delta = (cube_rtt_scale * offs * offs * offs) >> (10+3*BICTCP_HZ);
++	if (t < ca->bic_K)                                	/* below origin*/
++		bic_target = ca->bic_origin_point - delta - ca->gcn_decr;
++	else                                                	/* above origin*/
++		bic_target = ca->bic_origin_point + delta - ca->gcn_decr;
++
++	ca->last_bic_target = bic_target;
++
++	/* TCP Friendly */
++	if (tcp_friendliness) {
++		u32 scale = beta_scale;
++		if (ack_cnt_divisor > 1)
++			scale *= ack_cnt_divisor;
++		delta = (cwnd * scale) >> 3;
++		while (ca->ack_cnt > delta) {		/* update tcp cwnd */
++			ca->ack_cnt -= delta;
++			ca->tcp_cwnd++;
++		}
++	}
++}
++
++static void bictcp_cong_avoid(struct sock *sk, u32 ack,
++			      u32 pkts_acked, u32 in_flight)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct bictcp *ca = inet_csk_ca(sk);
++
++	if (!tcp_is_cwnd_limited(sk, in_flight))
++		return;
++
++	/* Only grow cwnd if NV has not detected congestion */
++	if (sysctl_tcp_nv_enable && ca->nv_enable && !ca->nv_allow_cwnd_growth)
++		return;
++
++	if (tp->snd_cwnd <= tp->snd_ssthresh) {
++		if (hystart && after(ack, ca->end_seq))
++			bictcp_hystart_reset(sk);
++	} else {
++		u32 target;
++		bictcp_update(ca, pkts_acked, tp->snd_cwnd);
++		/* Compute target cwnd based on bic_target and tcp_cwnd
++		 * (whichever is faster)
++		 */
++		target = (ca->last_bic_target >= ca->tcp_cwnd) ?
++				ca->last_bic_target : ca->tcp_cwnd;
++		while (pkts_acked > 0) {
++			u32 cnt;
++			if (target > tp->snd_cwnd)
++				cnt = tp->snd_cwnd / (target - tp->snd_cwnd);
++			else
++				cnt = 100 * tp->snd_cwnd;
++
++			/*
++			 * The initial growth of cubic function may be
++			 * too conservative when the available
++			 * bandwidth is still unknown.
++			 */
++			if (ca->last_max_cwnd == 0 && cnt > 20)
++				cnt = 20;   /* increase cwnd 5% per RTT */
++
++			if (cnt == 0)		/* cannot be zero */
++				cnt = 1;
++
++			tcp_cong_avoid_ai(tp, 1, cnt);
++			pkts_acked--;
++		}
++	}
++
++}
++
++static u32 bictcp_recalc_ssthresh(struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	struct bictcp *ca = inet_csk_ca(sk);
++
++	ca->epoch_start = 0;	/* end of epoch */
++
++	/* Wmax and fast convergence */
++	if (tp->snd_cwnd < ca->last_max_cwnd && fast_convergence)
++		ca->last_max_cwnd = (tp->snd_cwnd * (BICTCP_BETA_SCALE + beta))
++			/ (2 * BICTCP_BETA_SCALE);
++	else
++		ca->last_max_cwnd = tp->snd_cwnd;
++
++	ca->loss_cwnd = tp->snd_cwnd;
++
++	if (tp->num_connections) {
++		/* Emulate multiple connections, by reducing just one
++		 * Nth of cwnd:
++		 * cwnd = cwnd * ( (N-1)/N + 0.7/N )
++		 * where 0.7 is derived from beta/BICTCP_BETA_SCALE.
++		 * cwnd_multcp is used to derive the first term.
++		 * beta_scale_multcp is used to derive the second term.
++		 */
++		int cwnd_multcp = (tp->snd_cwnd * (tp->num_connections - 1)) /
++				  tp->num_connections;
++		int beta_scale_multcp = BICTCP_BETA_SCALE * tp->num_connections;
++
++		return max(cwnd_multcp + (tp->snd_cwnd * beta) /
++			   beta_scale_multcp, 2U);
++	}
++	return max((tp->snd_cwnd * beta) / BICTCP_BETA_SCALE, 2U);
++}
++
++static u32 bictcp_undo_cwnd(struct sock *sk)
++{
++	struct bictcp *ca = inet_csk_ca(sk);
++
++	return max(tcp_sk(sk)->snd_cwnd, ca->loss_cwnd);
++}
++
++static void bictcp_state(struct sock *sk, u8 new_state)
++{
++	if (new_state == TCP_CA_Loss) {
++		bictcp_reset(inet_csk_ca(sk));
++		bictcp_hystart_reset(sk);
++	}
++}
++
++static void hystart_update(struct sock *sk, u32 delay)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct bictcp *ca = inet_csk_ca(sk);
++
++	if (!(ca->found & hystart_detect)) {
++		u32 now = bictcp_clock();
++
++		/* first detection parameter - ack-train detection */
++		if ((s32)(now - ca->last_ack) <= hystart_ack_delta) {
++			ca->last_ack = now;
++			if ((s32)(now - ca->round_start) > ca->delay_min >> 4)
++				ca->found |= HYSTART_ACK_TRAIN;
++		}
++
++		/* obtain the minimum delay of more than sampling packets */
++		if (ca->sample_cnt < HYSTART_MIN_SAMPLES) {
++			if (ca->curr_rtt == 0 || ca->curr_rtt > delay)
++				ca->curr_rtt = delay;
++
++			ca->sample_cnt++;
++		} else {
++			if (ca->curr_rtt > ca->delay_min +
++			    HYSTART_DELAY_THRESH(ca->delay_min>>4))
++				ca->found |= HYSTART_DELAY;
++		}
++		/*
++		 * Either one of two conditions are met,
++		 * we exit from slow start immediately.
++		 */
++		if (ca->found & hystart_detect)
++			tp->snd_ssthresh = tp->snd_cwnd;
++	}
++}
++
++/* Track delayed acknowledgment ratio using sliding window
++ * ratio = (15*ratio + sample) / 16
++ * Do congestion avoidance calculations for TCP-NV
++ */
++static void bictcp_acked(struct sock *sk, u32 cnt, s32 rtt_us)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct bictcp *ca = inet_csk_ca(sk);
++	unsigned long now = jiffies;
++	u32 delay;
++	s64 rate64 = 0;
++	u32 rate, slope;
++	u32 max_win, cwnd_by_slope;
++	u32 avg_rtt, cwnd_pad;
++	u32 bytes_acked = 0;
++
++	/* Find how many bytes have been acked since last call to this
++	 * this function
++	 */
++	if (ca->nv_last_snd_una != 0)
++		bytes_acked = tp->snd_una - ca->nv_last_snd_una;
++	ca->nv_last_snd_una = tp->snd_una;
++
++	/* Some calls are for duplicates without timetamps */
++	if (rtt_us < 0)
++		return;
++
++	/* Discard delay samples right after fast recovery */
++	if (ca->epoch_start && (s32)(tcp_time_stamp - ca->epoch_start) >= HZ) {
++		delay = (rtt_us << 3) / USEC_PER_MSEC;
++		if (delay == 0)
++			delay = 1;
++
++		/* first time call or link delay decreases */
++		if (ca->delay_min == 0 || ca->delay_min > delay)
++			ca->delay_min = delay;
++
++		/* hystart triggers when cwnd is larger than some threshold */
++		if (hystart && tp->snd_cwnd <= tp->snd_ssthresh &&
++		    tp->snd_cwnd >= hystart_low_window)
++			hystart_update(sk, delay);
++	}
++
++	/* If NV mode is not enabled, behave like Cubic */
++	if (!sysctl_tcp_nv_enable  ||  !ca->nv_enable) {
++		ca->nv_allow_cwnd_growth = 1;
++		return;
++	}
+
++	if (tp->tcp_nv_unacked == 0)
++		return;
++
++	rate64 = ((s64)tp->tcp_nv_unacked)*1000000/rtt_us;
++	rate = 8*rate64/100; /* rate in 100's bits per second */
++
++	/* Calculate moving average of RTT */
++	if (ca->nv_last_rtt > 0)
++		avg_rtt = (((u64)rtt_us)*sysctl_tcp_nv_rtt_alpha +
++		  ((u64)ca->nv_last_rtt)*(256 - sysctl_tcp_nv_rtt_alpha))>>8;
++	else
++		avg_rtt = rtt_us;
++
++	ca->nv_last_rtt = avg_rtt;
++
++	/* We have valid information, increment counter */
++	ca->nv_eval_call_cnt++;
++
++	/* update min rtt if necessary */
++	if (avg_rtt < ca->nv_min_rtt)
++		ca->nv_min_rtt = avg_rtt;
++
++	/* update future min_rtt if necessary */
++	if (avg_rtt < ca->nv_min_rtt_new)
++		ca->nv_min_rtt_new = avg_rtt;
++
++	/* nv_min_rtt contains the minimum rtt seen in the last
++	 * sysctl_tcp_nv_reset_period to 2*sysctl_tcp_nv_reset_period seconds.
++	 */
++	if (time_after_eq(now, ca->nv_min_rtt_reset_jiffies)) {
++		ca->nv_min_rtt = ca->nv_min_rtt_new;
++		ca->nv_min_rtt_new = NV_INIT_RTT;
++		ca->nv_min_rtt_reset_jiffies = now +
++		  sysctl_tcp_nv_reset_period*HZ;
++
++		/* Every so often we decrease nv_min_cwnd in case previous
++		 *  value is no longer accurate.
++		 */
++		ca->nv_min_cwnd = ca->nv_min_cwnd/2;
++		if (ca->nv_min_cwnd < NV_MIN_CWND)
++			ca->nv_min_cwnd = NV_MIN_CWND;
++	}
++
++	/* Remember the maximum rate seen during this RTT
++	 * Note: It may be more than one RTT. This function should be
++	 *       called at least sysctl_tcp_nv_eval_min_calls times.
++	 */
++	if (ca->nv_rtt_max_rate < rate)
++		ca->nv_rtt_max_rate = rate;
++
++	/* Once per RTT check if we need to do congestion avoidance
++	 */
++	if (before(ca->nv_rtt_start_seq, tp->snd_una)) {
++		ca->nv_rtt_start_seq = tp->snd_nxt;
++		ca->nv_rtt_cnt++;
++
++		/* If this function is only called once within an RTT
++		 * the cwnd is probably too small (in some cases due to
++		 * tso, lro or interrupt coalescence), so we increase
++		 * nv_min_cwnd.
++		 */
++		if (ca->nv_eval_call_cnt == 1  &&
++			bytes_acked >= (ca->nv_min_cwnd-1)*tp->mss_cache &&
++			 ca->nv_min_cwnd < (NV_TSO_CWND_BOUND + 1)) {
++			ca->nv_min_cwnd = ca->nv_min_cwnd + NV_MIN_CWND_GROW;
++			if (ca->nv_min_cwnd > NV_TSO_CWND_BOUND + 1)
++				ca->nv_min_cwnd = NV_TSO_CWND_BOUND + 1;
++			ca->nv_rtt_start_seq = tp->snd_nxt +
++					       ca->nv_min_cwnd*tp->mss_cache;
++			ca->nv_eval_call_cnt = 0;
++			ca->nv_allow_cwnd_growth = 1;
++			return;
++		}
++
++		/* If cwnd is smaller than min, let cubic grow it */
++		if (tp->snd_cwnd < ca->nv_min_cwnd ||
++		    tp->snd_cwnd < sysctl_tcp_nv_min_cwnd) {
++			ca->nv_allow_cwnd_growth = 1;
++			return;
++		}
++
++		/* find ideal cwnd for current rate from slope */
++		slope = ((u64)80000)*tp->mss_cache/ca->nv_min_rtt;
++		slope = slope < 1 ? 1 : slope;
++
++		cwnd_by_slope = (ca->nv_rtt_max_rate + slope - 1) / slope;
++
++		cwnd_pad = sysctl_tcp_nv_pad; /* default padding of cwnd */
++
++		max_win = cwnd_by_slope + cwnd_pad;
++
++		/* If cwnd > max_win, decrease cwnd
++		 * if cwnd < max_win, grow cwnd
++		 * else leave the same
++		 */
++		if (tp->snd_cwnd > max_win) {
++			/* there is congestion, check that it is ok
++			 * to make a ca decision
++			 * 1. This function should be called at least
++			 * (i.e. we should have at least this many data points)
++			 * sysctl_tcp_nv_eval_min_calls times before making a
++			 * congestion avoidance decision
++			 */
++			if (ca->nv_eval_call_cnt < sysctl_tcp_nv_eval_min_calls)
++				return;
++
++			/* We only make a congestion decision after
++			 * sysctl_tcp_nv_rtt_min_cnt RTTs
++			 */
++			if (ca->nv_rtt_cnt < sysctl_tcp_nv_rtt_min_cnt)
++				return;
++
++			ca->nv_allow_cwnd_growth = 0; /* don't grow cwnd */
++			tp->snd_ssthresh = max_win;
++			if (tp->snd_cwnd - max_win > 2) {
++				int dec;
++				dec = (tp->snd_cwnd - max_win) *
++					sysctl_tcp_nv_cong_decrease_mult/100;
++				if (dec < 1 &&
++				    sysctl_tcp_nv_cong_decrease_mult > 0)
++					dec = 2;
++				tp->snd_cwnd -= dec;
++			} else if (sysctl_tcp_nv_cong_decrease_mult > 0) {
++				tp->snd_cwnd = max_win;
++			}
++		} else if (tp->snd_cwnd <  max_win) {
++			ca->nv_allow_cwnd_growth = 1; /* grow cwnd */
++		} else {
++			ca->nv_allow_cwnd_growth = 0; /* don't grow cwnd */
++		}
++		/* update state */
++		ca->nv_eval_call_cnt = 0;
++		ca->nv_rtt_cnt = 0;
++		ca->nv_rtt_max_rate = 0;
++
++		/* Don't want to make cwnd < sysctl_tcp_nv_min_cwnd
++		 * (it wasn't before, if it is now is because nv
++		 *  decreased it).
++		 */
++		if (tp->snd_cwnd < sysctl_tcp_nv_min_cwnd)
++			tp->snd_cwnd = sysctl_tcp_nv_min_cwnd;
++
++	}
++}
++
++static struct tcp_congestion_ops tcpnv __read_mostly = {
++	.init		= bictcp_init,
++	.ssthresh	= bictcp_recalc_ssthresh,
++	.cong_avoid	= bictcp_cong_avoid,
++	.set_state	= bictcp_state,
++	.undo_cwnd	= bictcp_undo_cwnd,
++	.pkts_acked     = bictcp_acked,
++	.owner		= THIS_MODULE,
++	.name		= "nv",
++};
++
++static int __init tcpnv_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct bictcp) > ICSK_CA_PRIV_SIZE);
++
++	/* Precompute a bunch of the scaling factors that are used per-packet
++	 * based on SRTT of 100ms
++	 */
++
++	beta_scale = 8*(BICTCP_BETA_SCALE+beta) / 3 / (BICTCP_BETA_SCALE - beta);
++
++	cube_rtt_scale = (bic_scale * 10);	/* 1024*c/rtt */
++
++	/* calculate the "K" for (wmax-cwnd) = c/rtt * K^3
++	 *  so K = cubic_root( (wmax-cwnd)*rtt/c )
++	 * the unit of K is bictcp_HZ=2^10, not HZ
++	 *
++	 *  c = bic_scale >> 10
++	 *  rtt = 100ms
++	 *
++	 * the following code has been designed and tested for
++	 * cwnd < 1 million packets
++	 * RTT < 100 seconds
++	 * HZ < 1,000,00  (corresponding to 10 nano-second)
++	 */
++
++	/* 1/c * 2^2*bictcp_HZ * srtt */
++	cube_factor = 1ull << (10+3*BICTCP_HZ); /* 2^40 */
++
++	/* divide by bic_scale and by constant Srtt (100ms) */
++	do_div(cube_factor, bic_scale * 10);
++
++	/* hystart needs ms clock resolution */
++	if (hystart && HZ < 1000)
++		tcpnv.flags |= TCP_CONG_RTT_STAMP;
++
++	return tcp_register_congestion_control(&tcpnv);
++}
++
++static void __exit tcpnv_unregister(void)
++{
++	tcp_unregister_congestion_control(&tcpnv);
++}
++
++module_init(tcpnv_register);
++module_exit(tcpnv_unregister);
++
++MODULE_AUTHOR("Sangtae Ha, Stephen Hemminger, Lawrence Brakmo");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("NV TCP");
++MODULE_VERSION("2.3");
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 51bcae9..02165cc 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+ 
++/* TCP_NV is enabled by default when chosen as the CA algorithm
++ * When disabled, NV behaves like CUBIC
++ */
++unsigned int sysctl_tcp_nv_enable = 1;
++
++/* Min RTT is reset every 15 secs (warms up for 15, then runs for 15) */
++unsigned int sysctl_tcp_nv_reset_period = 15;
++
++/* Number of RTT and rate measurements before making a ca decision */
++unsigned int sysctl_tcp_nv_eval_min_calls = 10;
++
++/* Number of RTTs before making a ca decision */
++unsigned int sysctl_tcp_nv_rtt_min_cnt = 3;
++
++/* Grow cwnd if cwnd is smaller than pred_cwnd + pad */
++unsigned int sysctl_tcp_nv_pad = 1;
++
++/* Used for enabling/disabling NV based on IP addr of other host.
++ * When disabled, NV behaves like Cubic.
++ */
++unsigned int sysctl_tcp_nv_ip_mask = 0xff000000;
++
++/* Enabled by default. If non zero, NV is enabled only if masked IP addr
++ * of other host matches this ip addr.
++ */
++unsigned int sysctl_tcp_nv_enable_ip_addr;
++
++/* Disable NV for internal hosts. If non zero, NV is disabled if masked IP addr
++ * of other host matches this ip addr.
++ */
++unsigned int sysctl_tcp_nv_disable_ip_addr = 0x0a000000;
++
++/* Don't decrease cwnd due to NV congestion avoidance when cwnd is smaller */
++unsigned int sysctl_tcp_nv_min_cwnd = 20;
++
++/* When congestion is detected by NV, decrease cwnd by this percentage of
++ * (cwnd - desired_cwnd), or 1 if the percentage is 0.
++ */
++unsigned int sysctl_tcp_nv_cong_decrease_mult = 20;
++
++/* Used for averaging RTTs, avg = (new*alpha + old*(alpha-256))/256 */
++unsigned int sysctl_tcp_nv_rtt_alpha = 128;
++
++/* Version number, read only */
++unsigned int sysctl_tcp_nv_version = 12;
++
++EXPORT_SYMBOL(sysctl_tcp_nv_enable);
++EXPORT_SYMBOL(sysctl_tcp_nv_pad);
++EXPORT_SYMBOL(sysctl_tcp_nv_reset_period);
++EXPORT_SYMBOL(sysctl_tcp_nv_eval_min_calls);
++EXPORT_SYMBOL(sysctl_tcp_nv_rtt_min_cnt);
++EXPORT_SYMBOL(sysctl_tcp_nv_ip_mask);
++EXPORT_SYMBOL(sysctl_tcp_nv_enable_ip_addr);
++EXPORT_SYMBOL(sysctl_tcp_nv_disable_ip_addr);
++EXPORT_SYMBOL(sysctl_tcp_nv_min_cwnd);
++EXPORT_SYMBOL(sysctl_tcp_nv_version);
++EXPORT_SYMBOL(sysctl_tcp_nv_cong_decrease_mult);
++EXPORT_SYMBOL(sysctl_tcp_nv_rtt_alpha);
+
+@@ -950,7 +1009,7 @@ int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
+ {
+
+-	struct tcp_sock *tp;
++	struct tcp_sock *tp = tcp_sk(sk);
+
+@@ -970,6 +1029,7 @@ int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
+
++	TCP_SKB_CB(skb)->unacked = tp->snd_nxt - tp->snd_una + skb->len;
+ 
+@@ -1262,6 +1321,9 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
+ 	TCP_SKB_CB(buff)->when = TCP_SKB_CB(skb)->when;
+ 	buff->tstamp = skb->tstamp;
+ 
++	TCP_SKB_CB(buff)->unacked = TCP_SKB_CB(skb)->unacked;
++	TCP_SKB_CB(skb)->unacked -= nsize;
++
+ 	old_factor = tcp_skb_pcount(skb);
+ 
+ 	/* Fix up tso_factor for both original and new SKB.  */
+

@@ -1,0 +1,158 @@
+diff -paur linux-3.5.7/include/linux/sysctl.h linux-3.5.7_siad-sysctl/include/linux/sysctl.h
+--- linux-3.5.7/include/linux/sysctl.h	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/include/linux/sysctl.h	2014-10-21 14:26:13.260651350 +0200
+@@ -425,6 +425,8 @@ enum
+ 	NET_TCP_ALLOWED_CONG_CONTROL=123,
+ 	NET_TCP_MAX_SSTHRESH=124,
+ 	NET_TCP_FRTO_RESPONSE=125,
++	NET_TCP_SIAD_NUM_RTT=128,
++	NET_TCP_SIAD_NUM_MS=129,
+ };
+ 
+ enum {
+diff -paur linux-3.5.7/include/linux/tcp.h linux-3.5.7_siad-sysctl/include/linux/tcp.h
+--- linux-3.5.7/include/linux/tcp.h	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/include/linux/tcp.h	2014-03-31 18:36:50.000000000 +0200
+@@ -110,6 +110,7 @@ enum {
+ #define TCP_REPAIR_QUEUE	20
+ #define TCP_QUEUE_SEQ		21
+ #define TCP_REPAIR_OPTIONS	22
++#define TCP_SIAD_NUM_RTT	23
+ 
+ struct tcp_repair_opt {
+ 	__u32	opt_code;
+diff -paur linux-3.5.7/include/net/tcp.h linux-3.5.7_siad-sysctl/include/net/tcp.h
+--- linux-3.5.7/include/net/tcp.h	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/include/net/tcp.h	2014-10-21 14:27:02.212652513 +0200
+@@ -253,6 +253,9 @@ extern int sysctl_tcp_cookie_size;
+ extern int sysctl_tcp_thin_linear_timeouts;
+ extern int sysctl_tcp_thin_dupack;
+ extern int sysctl_tcp_early_retrans;
++extern int sysctl_tcp_siad_num_rtt;
++extern int sysctl_tcp_siad_num_ms;
++
+ 
+ extern atomic_long_t tcp_memory_allocated;
+ extern struct percpu_counter tcp_sockets_allocated;
+Only in linux-3.5.7_siad-sysctl/include/net: tcp.h~
+diff -paur linux-3.5.7/kernel/sysctl_binary.c linux-3.5.7_siad-sysctl/kernel/sysctl_binary.c
+--- linux-3.5.7/kernel/sysctl_binary.c	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/kernel/sysctl_binary.c	2014-10-21 14:27:33.283653252 +0200
+@@ -400,6 +400,8 @@ static const struct bin_table bin_net_ip
+ 	/* NET_TCP_AVAIL_CONG_CONTROL "tcp_available_congestion_control" no longer used */
+ 	{ CTL_STR,	NET_TCP_ALLOWED_CONG_CONTROL,		"tcp_allowed_congestion_control" },
+ 	{ CTL_INT,	NET_TCP_MAX_SSTHRESH,			"tcp_max_ssthresh" },
++	{ CTL_INT,	NET_TCP_SIAD_NUM_RTT,			"tcp_siad_num_rtt" },
++	{ CTL_INT,	NET_TCP_SIAD_NUM_MS,			"tcp_siad_num_ms" },
+ 
+ 	{ CTL_INT,	NET_IPV4_ICMP_ECHO_IGNORE_ALL,		"icmp_echo_ignore_all" },
+ 	{ CTL_INT,	NET_IPV4_ICMP_ECHO_IGNORE_BROADCASTS,	"icmp_echo_ignore_broadcasts" },
+diff -paur linux-3.5.7/net/ipv4/Kconfig linux-3.5.7_siad-sysctl/net/ipv4/Kconfig
+--- linux-3.5.7/net/ipv4/Kconfig	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/net/ipv4/Kconfig	2014-10-21 14:28:55.673655210 +0200
+@@ -567,6 +567,19 @@ config TCP_CONG_ILLINOIS
+ 	For further details see:
+ 	  http://www.ews.uiuc.edu/~shaoliu/tcpillinois/index.html
+ 
++config TCP_CONG_SIAD
++	tristate "TCP SIAD"
++	depends on EXPERIMENTAL
++	default n
++	---help---
++	TCP SIAD is congestion control scheme that dynmaically adapt the 
++	increase step and the decrease factor (to the buffer size based on
++	RTT measurements). Further a new parameter configures the 
++	congestion event length and therefore the aggressivness.
++	
++	For further details see:
++	  http://mirja.kuehlewind.net/siad
++
+ choice
+ 	prompt "Default TCP congestion control"
+ 	default DEFAULT_CUBIC
+@@ -595,6 +608,9 @@ choice
+ 	config DEFAULT_WESTWOOD
+ 		bool "Westwood" if TCP_CONG_WESTWOOD=y
+ 
++	config DEFAULT_SIAD
++		bool "Siad" if TCP_CONG_SIAD=y
++
+ 	config DEFAULT_RENO
+ 		bool "Reno"
+ 
+@@ -616,6 +632,7 @@ config DEFAULT_TCP_CONG
+ 	default "vegas" if DEFAULT_VEGAS
+ 	default "westwood" if DEFAULT_WESTWOOD
+ 	default "veno" if DEFAULT_VENO
++	default "siad" if DEFAULT_SIAD
+ 	default "reno" if DEFAULT_RENO
+ 	default "cubic"
+ 
+diff -paur linux-3.5.7/net/ipv4/Makefile linux-3.5.7_siad-sysctl/net/ipv4/Makefile
+--- linux-3.5.7/net/ipv4/Makefile	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/net/ipv4/Makefile	2014-10-21 14:09:22.917029849 +0200
+@@ -48,6 +48,7 @@ obj-$(CONFIG_TCP_CONG_SCALABLE) += tcp_s
+ obj-$(CONFIG_TCP_CONG_LP) += tcp_lp.o
+ obj-$(CONFIG_TCP_CONG_YEAH) += tcp_yeah.o
+ obj-$(CONFIG_TCP_CONG_ILLINOIS) += tcp_illinois.o
++obj-$(CONFIG_TCP_CONG_SIAD) += tcp_siad.o
+ obj-$(CONFIG_CGROUP_MEM_RES_CTLR_KMEM) += tcp_memcontrol.o
+ obj-$(CONFIG_NETLABEL) += cipso_ipv4.o
+ 
+diff -paur linux-3.5.7/net/ipv4/sysctl_net_ipv4.c linux-3.5.7_siad-sysctl/net/ipv4/sysctl_net_ipv4.c
+--- linux-3.5.7/net/ipv4/sysctl_net_ipv4.c	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/net/ipv4/sysctl_net_ipv4.c	2014-10-21 14:30:06.829656901 +0200
+@@ -687,6 +687,20 @@ static struct ctl_table ipv4_table[] = {
+ 		.extra2		= &two,
+ 	},
+ 	{
++		.procname	= "tcp_siad_num_rtt",
++		.data		= &sysctl_tcp_siad_num_rtt,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++	{
++		.procname	= "tcp_siad_num_ms",
++		.data		= &sysctl_tcp_siad_num_ms,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++	{
+ 		.procname	= "udp_mem",
+ 		.data		= &sysctl_udp_mem,
+ 		.maxlen		= sizeof(sysctl_udp_mem),
+diff -paur linux-3.5.7/net/ipv4/tcp.c linux-3.5.7_siad-sysctl/net/ipv4/tcp.c
+--- linux-3.5.7/net/ipv4/tcp.c	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/net/ipv4/tcp.c	2014-10-21 14:42:13.892674181 +0200
+@@ -2638,6 +2638,15 @@ static int do_tcp_setsockopt(struct sock
+ 		else
+ 			icsk->icsk_user_timeout = msecs_to_jiffies(val);
+ 		break;
++	case TCP_SIAD_NUM_RTT:
++		/* Defines the desired distance between to congestion events in number of RTTs
++		 * if SIAD congestion control is used
++		 */
++		if (!strcmp(icsk->icsk_ca_ops->name, "siad") && val > 0) {
++			int *setvalue = (int*) inet_csk_ca(sk);
++			*setvalue = val;
++		}
++		break;
+ 	default:
+ 		err = -ENOPROTOOPT;
+ 		break;
+diff -paur linux-3.5.7/net/ipv4/tcp_input.c linux-3.5.7_siad-sysctl/net/ipv4/tcp_input.c
+--- linux-3.5.7/net/ipv4/tcp_input.c	2012-10-12 22:48:25.000000000 +0200
++++ linux-3.5.7_siad-sysctl/net/ipv4/tcp_input.c	2014-10-21 14:32:16.329659979 +0200
+@@ -101,6 +101,9 @@ int sysctl_tcp_moderate_rcvbuf __read_mo
+ int sysctl_tcp_abc __read_mostly;
+ int sysctl_tcp_early_retrans __read_mostly = 2;
+ 
++int sysctl_tcp_siad_num_rtt __read_mostly = 0;
++int sysctl_tcp_siad_num_ms __read_mostly = 0;
++
+ #define FLAG_DATA		0x01 /* Incoming frame contained data.		*/
+ #define FLAG_WIN_UPDATE		0x02 /* Incoming ACK was a window update.	*/
+ #define FLAG_DATA_ACKED		0x04 /* This ACK acknowledged new data.		*/
+Only in linux-3.5.7_siad-sysctl/net/ipv4: tcp_siad.c
